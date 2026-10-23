@@ -11,7 +11,7 @@
 //  · 켜기는 그 기기에서만(브라우저 권한 창), 끄기는 어디서든 (구독의 on만 내린다 — 서버가 건너뛴다).
 //  · 손님(비로그인)이 남긴 댓글·방명록은 푸시가 안 간다 — 손님은 구독을 읽을 수 없고 라우트도 거부한다. 종 알림은 그대로.
 import { backend, isServerMode } from './backend';
-import { fetchList, syncList } from './db';
+import { loadListOnce, saveListDiff } from './postStore';
 import { currentUserId } from './currentUser';
 import { getSetting } from './settingStore';
 
@@ -30,7 +30,6 @@ export interface PushSub {
   createdAt: string;
   authorId: string;                    // = userId (서버 규칙: 주인만 고치고 지운다)
   visibility: 'member';                // 회원끼리 읽힌다 (보내는 쪽이 받는 사람 구독을 읽어야 한다)
-  [k: string]: unknown;                // O.home의 ListItem 제약 (fetchList/syncList) 충족
 }
 
 export function pushSupported(): boolean {
@@ -163,7 +162,7 @@ function siteIcon(): string | undefined {
 let subsCache: { at: number; list: PushSub[] } | null = null;
 async function allSubs(): Promise<PushSub[]> {
   if (subsCache && Date.now() - subsCache.at < 15000) return subsCache.list;
-  const list = await fetchList<PushSub>('push_subs');
+  const list = await loadListOnce<PushSub>(PUSH_KEY);
   subsCache = { at: Date.now(), list };
   return list;
 }
@@ -200,7 +199,7 @@ export async function webPushTo(userIds: string[], payload: PushPayload): Promis
     const me = currentUserId();
     const deadMine = list.filter(s => s.userId === me && (out.dead ?? []).includes(s.endpoint));
     if (deadMine.length) {
-      await syncList('push_subs', list, list.filter(s => !deadMine.includes(s)), me);
+      await saveListDiff(PUSH_KEY, list, list.filter(s => !deadMine.includes(s)));
       subsCache = null;
     }
     return out;

@@ -10,10 +10,10 @@
 import { newId } from './postStore';
 import { isServerMode, backend } from './backend';
 import { fetchList, syncList } from './db';
-import { webPushTo } from './push';
 import { currentUserId } from './currentUser';
+import { webPushTo } from './push';
 
-export type NotifType = 'rp' | 'comment' | 'guest';
+export type NotifType = 'rp' | 'comment' | 'guest' | 'thread' | 'memo' | 'diary';   // memo·diary: 커플홈 (상대방에게)
 export interface Notif {
   id: string;
   type: NotifType;
@@ -42,7 +42,8 @@ const SET_KEY = 'ohome.notifset.v1'; // 회원별 알림 항목 on/off — { [us
 export const NOTIF_EVENT = 'ohome-notif';
 
 export const NOTIF_TYPE_LABEL: Record<NotifType, string> = {
-  rp: '역극 새 메시지', comment: '내 글 댓글', guest: '방명록 (관리자)',
+  rp: '역극 새 메시지', comment: '내 글 댓글', guest: '방명록 (관리자)', thread: '감상타래 새 글',
+  memo: '메모장 새 메모', diary: '다이어리 새 일기',
 };
 
 export function readNotifs(): Notif[] {
@@ -62,8 +63,8 @@ function write(list: Notif[]) {
   window.dispatchEvent(new Event(NOTIF_EVENT));
 }
 
-export interface NotifSettings { rp: boolean; comment: boolean; guest: boolean }
-const DEFAULT_SET: NotifSettings = { rp: true, comment: true, guest: true };
+export interface NotifSettings { rp: boolean; comment: boolean; guest: boolean; thread: boolean; memo: boolean; diary: boolean }
+const DEFAULT_SET: NotifSettings = { rp: true, comment: true, guest: true, thread: true, memo: true, diary: true };
 
 export function notifSettings(userId: string): NotifSettings {
   try {
@@ -87,7 +88,7 @@ export function pushNotif(n: {
   type: NotifType; toUserId: string; title: string; body?: string; href: string; dedupeKey?: string;
 }) {
   if (!notifSettings(n.toUserId)[n.type]) return;
-  // 웹푸시 (자놀 이식) — 받는 사람이 정보수정에서 켜 둔 기기로. 실패해도 조용히. 같은 방·같은 글은 tag로 겹친다
+  // 웹푸시 (커플홈) — 받는 사람이 정보수정에서 켜 둔 기기로. 실패해도 조용히. 같은 방·같은 글은 tag로 겹친다
   void webPushTo([n.toUserId], { title: n.title, body: n.body, url: n.href, tag: n.dedupeKey ?? n.type, kind: n.type });
   const list = readNotifs();
   if (n.dedupeKey) {
@@ -135,6 +136,21 @@ export function notifyAdmins(n: { type: NotifType; title: string; body?: string;
       pushNotif({ ...n, toUserId: id });
     }
   });
+}
+
+/**
+ * 같이 쓰는 사람 모두에게 (커플홈 사용자 요청 — "자캐 메모를 남기거나 다이어리를 남긴 것도 상대방에게 알림이 가게").
+ * 회원 목록(useMembers)의 전원 — 관리자든 상대 오너든 — 에게, 본인은 뺀다.
+ * 목록이 아직 안 왔으면(서버 첫 화면·권한 문제) 관리자에게만이라도 (notifyAdmins).
+ */
+export function notifyMembers(
+  n: { type: NotifType; title: string; body?: string; href: string; dedupeKey?: string },
+  members: { id: string }[],
+) {
+  const me = currentUserId();
+  const ids = [...new Set(members.map(m => m.id).filter(id => !!id && id !== me))];
+  if (!ids.length) { notifyAdmins(n); return; }
+  for (const id of ids) pushNotif({ ...n, toUserId: id });
 }
 
 /* ---------- 서버 배달 (v2.0) ---------- */

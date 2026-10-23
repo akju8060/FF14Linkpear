@@ -43,25 +43,23 @@ export async function GET() {
  *  연결 설정이 없으면(브라우저 저장 모드) 회원 자체가 없으니 확인할 것도 없다 */
 async function verifyCaller(token: string): Promise<boolean> {
   const cfg = await serverSideConfig();
-  if (!cfg) return true;              // 브라우저 저장 모드 — 회원 자체가 없다
+  if (!cfg) return true;
   if (!token) return false;
   try {
-    if (cfg.kind === 'supabase') {
-      // Supabase — 액세스 토큰을 Auth 공개 API로 확인한다
-      const r = await fetch(`${cfg.url}/auth/v1/user`, {
-        headers: { Authorization: `Bearer ${token}`, apikey: cfg.anonKey }, cache: 'no-store',
+    if (cfg.kind === 'firebase') {
+      const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(cfg.apiKey)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: token }), cache: 'no-store',
       });
       if (!r.ok) return false;
-      const j = await r.json() as { id?: string };
-      return !!j.id;
+      const j = await r.json() as { users?: { localId?: string }[] };
+      return !!j.users?.[0]?.localId;
     }
-    // Firebase — ID 토큰을 Identity Toolkit 공개 API로 확인한다
-    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(cfg.apiKey)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ idToken: token }), cache: 'no-store',
+    const r = await fetch(`${cfg.url.replace(/\/$/, '')}/auth/v1/user`, {
+      headers: { apikey: cfg.anonKey, Authorization: `Bearer ${token}` }, cache: 'no-store',
     });
     if (!r.ok) return false;
-    const j = await r.json() as { users?: { localId?: string }[] };
-    return !!j.users?.[0]?.localId;
+    const j = await r.json() as { id?: string };
+    return !!j.id;
   } catch { return false; }
 }
 

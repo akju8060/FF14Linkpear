@@ -139,6 +139,8 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
     if (code.includes('permission-denied')) return '권한이 없습니다 — 보안 규칙이 적용됐는지 확인해 주세요.';
     return (e as { message?: string })?.message ?? '알 수 없는 오류입니다.';
   };
+  const isDenied = (e: unknown) => ((e as { code?: string })?.code ?? '').includes('permission-denied');
+  const INVITE_SETTING = 'ohome.invite.v1';   // 예전 자리 — settings(공개 읽기). 지금은 meta/invite(관리자만)
 
   return {
     kind: 'firebase',
@@ -201,12 +203,33 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
       } catch (e) { return { ok: false, error: humanError(e) }; }
     },
 
-    async signUp(id, password, nickname) {
+    async signUp(id, password, nickname, invite) {
       try {
         const cred = await authMod.createUserWithEmailAndPassword(auth, id, password);
         await authMod.updateProfile(cred.user, { displayName: nickname });
-        const r = await withLimit(
-          setDoc(doc(db, 'profiles', cred.user.uid), { nickname, createdAt: Date.now() }, { merge: true }));
+        const uid = cred.user.uid;
+        // 가입코드는 규칙이 검사한다 — signups/{uid}는 코드가 맞을 때만 만들어지고, 프로필(= 회원 자격)은 그 문서가
+        // 있어야 만들 수 있다. 계정(Authentication)은 공개 apiKey만으로 누구나 만들 수 있어(보안 제보 — 가입 화면을
+        // 거치지 않고 REST API로) 브라우저의 코드 검사는 우회되므로, 회원 자격을 프로필 문서에 묶었다.
+        // 예전 규칙(signups 항목이 없다)에서는 이 쓰기가 거부되지만 프로필은 그냥 만들어지므로 일단 진행하고,
+        // 프로필까지 거부되면 코드가 틀린 것 — 방금 만든 계정은 지운다 (프로필 없는 계정은 아무 권한도 없지만 치워 둔다)
+        let claimed = false;
+        if (invite !== undefined) {
+          try {
+            const s = await withLimit(setDoc(doc(db, 'signups', uid), { code: invite, at: Date.now() }));
+            claimed = s !== TIMEOUT;
+          } catch { claimed = false; }
+        }
+        let r: unknown;
+        try {
+          r = await withLimit(setDoc(doc(db, 'profiles', uid), { nickname, createdAt: Date.now() }, { merge: true }));
+        } catch (e) {
+          if (invite !== undefined && !claimed && isDenied(e)) {
+            try { await cred.user.delete(); } catch { await authMod.signOut(auth).catch(() => undefined); }
+            return { ok: false, error: '가입코드가 올바르지 않습니다.' };
+          }
+          throw e;
+        }
         // 계정(Auth)은 이미 만들어졌으므로 그 사실을 알려 준다 — 다시 시도하면 "이미 사용 중"이 뜬다
         if (r === TIMEOUT) return { ok: false, error: `${NO_REACH} (로그인 계정은 이미 만들어졌습니다)` };
         return { ok: true };
@@ -214,6 +237,12 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
     },
 
     async signOut() { await authMod.signOut(auth); },
+
+    async authToken() {
+      const u = auth.currentUser;
+      if (!u) return null;
+      try { return await u.getIdToken(); } catch { return null; }
+    },
 
     async resetPassword(email) {
       try {
@@ -225,24 +254,25 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
     async updateProfile(patch) {
       const u = auth.currentUser;
       if (!u) return { ok: false, error: '로그인이 필요합니다.' };
-      try {
-        // 비밀번호 변경 (v2.0 사용자 제보 — 서버 모드에서 아예 동작하지 않던 버그: 예전엔 이 필드를
-        // 무시하고 ok를 돌려줘 「변경됐습니다」만 뜨고 실제로는 안 바뀌었다). 민감한 작업이라
-        // 먼저 현재 비밀번호로 재인증해야 updatePassword가 허용된다.
-        if (patch.newPassword) {
-          if (!u.email) return { ok: false, error: '이 계정은 비밀번호 로그인 계정이 아닙니다.' };
-          try {
-            const cred = authMod.EmailAuthProvider.credential(u.email, patch.currentPassword ?? '');
-            await authMod.reauthenticateWithCredential(u, cred);
-          } catch (e) {
-            const code = (e as { code?: string })?.code ?? '';
-            if (code.includes('wrong-password') || code.includes('invalid-credential')) {
-              return { ok: false, error: '현재 비밀번호가 올바르지 않습니다.' };
-            }
-            return { ok: false, error: humanError(e) };   // too-many-requests 등
+      // 비밀번호 — 현재 비밀번호로 다시 인증한 뒤 바꾼다 (Firebase는 민감한 작업에 최근 로그인을 요구한다 — 재인증이 그 조건도 채운다).
+      // 여태 이 항목이 빠져 있어 마이페이지가 「변경되었습니다」만 띄우고 실제로는 안 바뀌었다 (커플홈 사용자 제보)
+      if (patch.newPassword) {
+        if (!u.email) return { ok: false, error: '이 계정은 이메일/비밀번호 로그인이 아니라 비밀번호를 바꿀 수 없습니다.' };
+        if (!patch.currentPassword) return { ok: false, error: '현재 비밀번호를 입력해 주세요.' };
+        try {
+          const cred = authMod.EmailAuthProvider.credential(u.email, patch.currentPassword);
+          await authMod.reauthenticateWithCredential(u, cred);
+          await authMod.updatePassword(u, patch.newPassword);
+        } catch (e) {
+          const code = (e as { code?: string })?.code ?? '';
+          if (code.includes('wrong-password') || code.includes('invalid-credential') || code.includes('invalid-login-credentials')) {
+            return { ok: false, error: '현재 비밀번호가 올바르지 않습니다.' };
           }
-          await authMod.updatePassword(u, patch.newPassword);   // weak-password는 아래 catch가 처리
+          if (code.includes('too-many-requests')) return { ok: false, error: '시도가 너무 많습니다 — 잠시 뒤 다시 해 주세요.' };
+          return { ok: false, error: humanError(e) };
         }
+      }
+      try {
         const row: Record<string, unknown> = {};
         if (patch.nickname !== undefined) row.nickname = patch.nickname;
         if (patch.avatarUrl !== undefined) row.avatarUrl = patch.avatarUrl ?? null;
@@ -251,12 +281,6 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
         if (patch.nickname) await authMod.updateProfile(u, { displayName: patch.nickname });
         return { ok: true };
       } catch (e) { return { ok: false, error: humanError(e) }; }
-    },
-
-    async authToken() {
-      const u = auth.currentUser;
-      if (!u) return null;
-      try { return await u.getIdToken(); } catch { return null; }
     },
 
     /** 첫 계정을 소유자(관리자)로 등록 — 규칙이 "없을 때 1회"만 허용한다 */
@@ -271,6 +295,49 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
         ownerCache = undefined;   // 방금 관리자가 됐으니 다시 판정하게
         return { ok: true };
       } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    // 가입코드 — meta/invite(관리자만 읽기). 없으면 예전 자리(settings/ohome.invite.v1 — 공개 읽기)에서 옮겨 온다 (한 번).
+    // 예전 규칙(meta/invite 항목이 없어 거부)이면 예전 자리의 값을 그대로 쓰고 legacy로 알린다
+    async getInviteCode() {
+      const oldCode = async () => {
+        const old = await getDoc(doc(db, 'settings', INVITE_SETTING)).catch(() => null);
+        return old?.exists() ? String((old.data() as { value?: unknown }).value ?? '').trim() : '';
+      };
+      try {
+        const snap = await getDoc(doc(db, 'meta', 'invite'));
+        if (snap.exists()) {
+          const c = String((snap.data() as { code?: unknown }).code ?? '').trim();
+          return { code: c || 'WELCOME' };
+        }
+        const code = await oldCode();
+        if (code) {
+          await setDoc(doc(db, 'meta', 'invite'), { code, updatedAt: Date.now() });
+          await deleteDoc(doc(db, 'settings', INVITE_SETTING)).catch(() => undefined);
+          return { code };
+        }
+        return { code: 'WELCOME' };
+      } catch (e) {
+        if (!isDenied(e)) throw e;
+        return { code: (await oldCode()) || 'WELCOME', legacy: true };
+      }
+    },
+
+    async setInviteCode(code) {
+      const c = code.trim();
+      try {
+        const r = await withLimit(setDoc(doc(db, 'meta', 'invite'), { code: c, updatedAt: Date.now() }));
+        if (r === TIMEOUT) return { ok: false, error: NO_REACH };
+        await deleteDoc(doc(db, 'settings', INVITE_SETTING)).catch(() => undefined);   // 예전 자리(공개)에 남은 값은 지운다
+        return { ok: true };
+      } catch (e) {
+        if (!isDenied(e)) return { ok: false, error: humanError(e) };
+        // 예전 규칙 — 설정(공개)에 저장. 규칙을 다시 게시하면 다음에 읽을 때 옮겨진다
+        try {
+          await setDoc(doc(db, 'settings', INVITE_SETTING), { value: c, updatedAt: Date.now() });
+          return { ok: true, legacy: true };
+        } catch (e2) { return { ok: false, error: humanError(e2) }; }
+      }
     },
 
     async listMembers() {
@@ -304,6 +371,17 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
         seen.set(d.id, { sort: raw.sort ?? 0, item: { ...(raw.data ?? {}), id: d.id } as T });
       }));
       return [...seen.values()].sort((a, b) => a.sort - b.sort).map(v => v.item);
+    },
+
+    async fetchOne<T extends ListItem>(coll: string, id: string): Promise<T | null> {
+      try {
+        const d = await getDoc(doc(db, coll, id));
+        if (!d.exists()) return null;
+        const raw = d.data() as { data?: Record<string, unknown> };
+        return { ...(raw.data ?? {}), id: d.id } as T;
+      } catch {
+        return null;   // 읽기 규칙에 막힘(권한 없음) 등 — 없는 것으로
+      }
     },
 
     async syncList<T extends ListItem>(coll: string, prev: T[], next: T[], uid: string | null) {
@@ -418,8 +496,10 @@ export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> 
     },
 
     async deleteMember(id) {
-      // profiles 문서만 지운다 — Authentication 계정은 관리자 키가 있어야 지울 수 있다
+      // profiles 문서만 지운다 — Authentication 계정은 관리자 키가 있어야 지울 수 있다.
+      // 프로필이 없으면 회원 권한도 없다(규칙). 가입코드 확인 기록(signups)도 지워 프로필을 다시 못 만들게
       await deleteDoc(doc(db, 'profiles', id));
+      await deleteDoc(doc(db, 'signups', id)).catch(() => undefined);
     },
   };
 
